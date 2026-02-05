@@ -1,0 +1,30 @@
+database:
+  host: localhost
+  port: 5433
+  name: soc_iot_db
+  user: soc_toolkit
+  password: change_this_password
+  pool_size: 5
+  max_overflow: 10
+
+nmap:
+  path: /usr/bin/nmap
+  timeout: 300
+  max_retries: 3
+  profiles:
+    quick: "-sn -T4"
+    standard: "-sS -sV -T4"
+    deep: "-sS -sV -sC -O -T4"
+    full: "-sS -sV -sC -O -A -T4"
+
+application:
+  log_level: INFO
+  log_dir: logs
+  scan_timeout: 300
+  max_concurrent_scans: 3
+  data_retention_days: 90
+
+ui:
+  port: 8501
+  theme: light
+  layout: wide
