@@ -203,6 +203,25 @@ def render_scan_options() -> Dict[str, Any]:
             key="port_range"
         )
     
+    # Performance options
+    st.markdown("#### Performance")
+    
+    col3, col4 = st.columns(2)
+    
+    with col3:
+        parallel_threads = st.slider(
+            "Parallel Threads",
+            min_value=1,
+            max_value=64,
+            value=16,
+            step=1,
+            key="parallel_threads",
+            help="Number of parallel scanning threads. Higher values = faster scans but may trigger IDS/IPS."
+        )
+    
+    with col4:
+        st.info(f"🚀 Using {parallel_threads} parallel threads for faster scanning")
+    
     # Map scan type
     scan_type_map = {
         "Quick (Host Discovery)": "quick",
@@ -214,6 +233,7 @@ def render_scan_options() -> Dict[str, Any]:
     options = {
         "scan_type": scan_type_map.get(scan_type, "standard"),
         "port_range": port_range,
+        "parallel_threads": parallel_threads,
     }
     
     if port_range == "Custom":

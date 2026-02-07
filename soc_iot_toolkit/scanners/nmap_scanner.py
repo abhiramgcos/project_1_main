@@ -266,15 +266,13 @@ class NmapScanner(BaseScanner):
                          self._sudo_password and 
                          self._requires_root_privileges(arguments))
             
-            # Use subprocess if:
-            # 1. python-nmap is not available, OR
-            # 2. We need to use sudo (library doesn't support sudo)
-            if needs_sudo or not (NMAP_AVAILABLE and self._scanner):
-                if needs_sudo:
-                    logger.debug("Using subprocess method for sudo-elevated scan")
-                devices = self._scan_with_subprocess(progress_callback, log_callback)
-            else:
-                devices = self._scan_with_library(progress_callback)
+            # ALWAYS use subprocess method for real-time progress tracking
+            # The python-nmap library's scan() is blocking and doesn't report progress
+            # until the entire scan completes, causing the UI to get stuck
+            logger.info("Using subprocess method for real-time progress tracking")
+            if needs_sudo:
+                logger.debug("Scan will use sudo for privileged operations")
+            devices = self._scan_with_subprocess(progress_callback, log_callback)
             
             result.devices = devices
             result.hosts_up = len(devices)
@@ -347,22 +345,19 @@ class NmapScanner(BaseScanner):
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
     ) -> List[DeviceInfo]:
-        """Execute scan using subprocess (fallback method) with real-time progress."""
+        """Execute scan using subprocess with real-time progress tracking."""
         devices = []
         
         try:
             arguments = self.get_scan_arguments()
-            # Add --stats-every to get periodic progress updates from nmap
+            # Add --stats-every for more frequent progress updates
             if "--stats-every" not in arguments:
-                arguments += " --stats-every 5s"
+                arguments += " --stats-every 3s"
             
             cmd = [self._nmap_path] + arguments.split() + ["-oX", "-", self._cidr]
             
             input_password = None
-            # Only use sudo if:
-            # 1. We're not already root
-            # 2. We have a sudo password configured
-            # 3. The scan arguments require root privileges
+            # Only use sudo if needed
             if not self._is_root() and self._sudo_password and self._requires_root_privileges(arguments):
                 cmd = ["sudo", "-S", "-p", ""] + cmd
                 input_password = self._sudo_password + "\n"
@@ -394,15 +389,54 @@ class NmapScanner(BaseScanner):
                 except:
                     pass
             
-            # Collect output using threads for real-time reading
+            # Progress tracking variables
             stdout_lines = []
             stderr_lines = []
             hosts_found = 0
             total_hosts = self.get_host_count()
+            nmap_reported_progress = 0  # Track nmap's reported progress
+            scan_start_time = datetime.now()
+            scan_complete = threading.Event()
+            
+            # Estimate scan duration based on scan type and host count
+            # Standard: ~2s/host, Deep: ~5s/host, Full: ~15s/host
+            scan_time_per_host = {
+                ScanType.QUICK: 0.5,
+                ScanType.STANDARD: 2.0,
+                ScanType.DEEP: 5.0,
+                ScanType.FULL: 15.0,
+            }
+            time_per_host = scan_time_per_host.get(self._scan_type, 3.0)
+            # Adjust for parallel threads (faster with more threads)
+            if self._parallel_threads > 1:
+                time_per_host = time_per_host / (self._parallel_threads ** 0.5)
+            estimated_duration = max(10, total_hosts * time_per_host)
+            
+            def time_based_progress():
+                """Background thread for smooth time-based progress updates."""
+                nonlocal nmap_reported_progress
+                last_progress = 5
+                while not scan_complete.is_set():
+                    elapsed = (datetime.now() - scan_start_time).total_seconds()
+                    
+                    # Calculate time-based progress (10-80% range)
+                    time_progress = 10 + (elapsed / estimated_duration) * 70
+                    time_progress = min(time_progress, 80)  # Cap at 80%
+                    
+                    # Use the higher of time-based or nmap-reported progress
+                    current_progress = max(time_progress, nmap_reported_progress)
+                    
+                    # Only update if progress increased
+                    if current_progress > last_progress:
+                        self._update_progress(current_progress, hosts_found)
+                        last_progress = current_progress
+                    
+                    # Check every 2 seconds
+                    scan_complete.wait(timeout=2)
             
             def read_stderr():
-                """Read stderr in background thread for progress updates."""
-                nonlocal hosts_found
+                """Read stderr for nmap progress updates."""
+                nonlocal hosts_found, nmap_reported_progress
                 try:
                     for line in iter(self._current_process.stderr.readline, ''):
                         if not line:
@@ -410,21 +444,19 @@ class NmapScanner(BaseScanner):
                         line = line.strip()
                         stderr_lines.append(line)
                         
-                        # Parse nmap progress from stderr (--stats-every output)
-                        # Format: "Stats: 0:00:30 elapsed; 128 hosts completed (1 up), 1 undergoing ..."
-                        # Or: "About 45.00% done; ETC: 12:30 (0:01:00 remaining)"
+                        # Parse nmap progress percentage
                         if "% done" in line.lower():
                             try:
                                 match = re.search(r'(\d+\.?\d*)%\s*done', line, re.IGNORECASE)
                                 if match:
                                     pct = float(match.group(1))
                                     # Map nmap's 0-100% to our 10-95% range
-                                    progress = 10 + (pct / 100) * 85
-                                    self._update_progress(progress, hosts_found)
+                                    nmap_reported_progress = 10 + (pct / 100) * 85
+                                    self._update_progress(nmap_reported_progress, hosts_found)
                             except:
                                 pass
                         
-                        # Also check for hosts completed
+                        # Parse hosts completed
                         if "hosts completed" in line.lower():
                             try:
                                 match = re.search(r'(\d+)\s*hosts completed', line, re.IGNORECASE)
@@ -432,6 +464,10 @@ class NmapScanner(BaseScanner):
                                     hosts_found = int(match.group(1))
                             except:
                                 pass
+                        
+                        # Parse "Nmap scan report" for host discovery progress
+                        if "nmap scan report for" in line.lower():
+                            hosts_found += 1
                         
                         if log_callback:
                             try:
@@ -442,7 +478,7 @@ class NmapScanner(BaseScanner):
                     logger.debug(f"Stderr reader error: {e}")
             
             def read_stdout():
-                """Read stdout (XML output) in background thread."""
+                """Read stdout (XML output)."""
                 nonlocal hosts_found
                 try:
                     for line in iter(self._current_process.stdout.readline, ''):
@@ -450,8 +486,8 @@ class NmapScanner(BaseScanner):
                             break
                         stdout_lines.append(line)
                         
-                        # Track progress by counting discovered hosts in XML
-                        if '<host ' in line:
+                        # Track hosts found in XML
+                        if '<host ' in line and 'endtime' not in line:
                             hosts_found += 1
                             progress = 10 + (hosts_found / max(total_hosts, 1)) * 85
                             progress = min(progress, 95)
@@ -459,30 +495,39 @@ class NmapScanner(BaseScanner):
                 except Exception as e:
                     logger.debug(f"Stdout reader error: {e}")
             
-            # Start reader threads
+            # Start all threads
+            progress_thread = threading.Thread(target=time_based_progress, daemon=True)
             stderr_thread = threading.Thread(target=read_stderr, daemon=True)
             stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+            
+            progress_thread.start()
             stderr_thread.start()
             stdout_thread.start()
             
-            # Wait for process to complete with timeout
+            # Update to show scan started
+            self._update_progress(10, 0)
+            
+            # Wait for process with timeout
             try:
                 self._current_process.wait(timeout=self._timeout)
             except subprocess.TimeoutExpired:
                 logger.warning("Nmap scan timed out, killing process")
                 self._current_process.kill()
                 self._current_process.wait(timeout=5)
-                
                 if log_callback:
                     try:
                         log_callback("[ERROR] Scan timed out")
                     except:
                         pass
                 raise TimeoutError(f"Scan timed out after {self._timeout} seconds")
+            finally:
+                # Signal progress thread to stop
+                scan_complete.set()
             
-            # Wait for reader threads to finish
+            # Wait for reader threads
             stderr_thread.join(timeout=5)
             stdout_thread.join(timeout=5)
+            progress_thread.join(timeout=2)
             
             stdout = ''.join(stdout_lines)
             stderr = '\n'.join(stderr_lines)

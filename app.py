@@ -197,11 +197,14 @@ def start_scan(config: Dict[str, Any]):
     # Generate scan ID
     scan_id = f"SCAN_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Create scanner
+    # Create scanner with parallel threads for faster scanning
+    parallel_threads = config.get("parallel_threads", 16)
+    
     scanner = NmapScanner(
         cidr=cidr,
         interface=interface,
         scan_type=scan_type,
+        parallel_threads=parallel_threads,
     )
     
     # Create database record
