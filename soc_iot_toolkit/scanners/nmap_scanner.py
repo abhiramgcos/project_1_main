@@ -30,9 +30,10 @@ class NmapScanner(BaseScanner):
     
     Provides comprehensive host discovery, port scanning,
     service detection, and OS fingerprinting capabilities.
+    Supports parallel scanning with configurable thread count.
     """
     
-    # Scan profile definitions
+    # Scan profile definitions (base arguments without parallelism)
     SCAN_PROFILES = {
         ScanType.QUICK: "-sn -T4 --max-retries 1",
         ScanType.STANDARD: "-sS -sV -T4 --top-ports 1000",
@@ -40,13 +41,18 @@ class NmapScanner(BaseScanner):
         ScanType.FULL: "-sS -sV -sC -O -A -T4 -p-",
     }
     
+    # Default parallelism settings
+    DEFAULT_PARALLEL_THREADS = 16
+    MAX_PARALLEL_THREADS = 256
+    
     def __init__(
         self,
         cidr: str,
         interface: Optional[str] = None,
         scan_type: ScanType = ScanType.STANDARD,
         custom_arguments: Optional[str] = None,
-        timeout: int = 300,
+        timeout: int = 3000,
+        parallel_threads: int = 16,
     ):
         """
         Initialize the Nmap scanner.
@@ -57,11 +63,15 @@ class NmapScanner(BaseScanner):
             scan_type: Type of scan to perform.
             custom_arguments: Custom Nmap arguments (overrides scan_type).
             timeout: Scan timeout in seconds.
+            parallel_threads: Number of parallel threads/probes for scanning (1-256).
+                             Higher values increase scan speed but may trigger IDS/IPS.
+                             Default: 16. Set to 0 to use Nmap's default auto-scaling.
         """
         super().__init__(cidr, interface, scan_type)
         
         self._custom_arguments = custom_arguments
         self._timeout = timeout
+        self._parallel_threads = min(max(0, parallel_threads), self.MAX_PARALLEL_THREADS)
         
         # Get sudo password from settings or env
         from ..config import get_settings
@@ -135,10 +145,49 @@ class NmapScanner(BaseScanner):
         
         return False
 
+    def get_parallelism_arguments(self) -> str:
+        """
+        Get Nmap parallelism arguments based on configured thread count.
+        
+        Returns:
+            String of parallelism-related Nmap arguments.
+        """
+        if self._parallel_threads <= 0:
+            # Use Nmap's default auto-scaling
+            return ""
+        
+        # Calculate optimal settings based on thread count
+        # --min-parallelism: Minimum number of parallel port probes
+        # --max-parallelism: Maximum number of parallel port probes  
+        # --min-hostgroup: Minimum number of hosts to scan in parallel
+        # --min-rate: Minimum packets per second
+        
+        args = []
+        
+        # Set parallelism (number of concurrent port probes)
+        args.append(f"--min-parallelism {self._parallel_threads}")
+        args.append(f"--max-parallelism {min(self._parallel_threads * 2, self.MAX_PARALLEL_THREADS)}")
+        
+        # Set host group size (scan multiple hosts in parallel)
+        # Use thread count as minimum host group for parallel host scanning
+        host_group = max(4, self._parallel_threads // 2)
+        args.append(f"--min-hostgroup {host_group}")
+        
+        # Set minimum packet rate for aggressive scanning
+        # Higher thread count = higher minimum rate
+        if self._parallel_threads >= 16:
+            min_rate = self._parallel_threads * 10  # e.g., 16 threads = 160 pps minimum
+            args.append(f"--min-rate {min_rate}")
+        
+        logger.info(f"Parallel scanning enabled: {self._parallel_threads} threads, hostgroup={host_group}")
+        
+        return " ".join(args)
+    
     def get_scan_arguments(self) -> str:
         """
         Get the Nmap arguments for the current scan configuration.
         Adjusts automatically for unprivileged execution.
+        Includes parallelism settings for faster scanning.
         """
         if self._custom_arguments:
             args = self._custom_arguments
@@ -155,6 +204,11 @@ class NmapScanner(BaseScanner):
             if "-O" in args:
                 logger.warning("Running without root privileges: Disabling OS detection (-O)")
                 args = args.replace("-O", "")
+        
+        # Add parallelism arguments for faster scanning
+        parallelism_args = self.get_parallelism_arguments()
+        if parallelism_args:
+            args = f"{args} {parallelism_args}"
         
         # Add interface if specified
         if self._interface:
@@ -293,11 +347,15 @@ class NmapScanner(BaseScanner):
         progress_callback: Optional[Callable] = None,
         log_callback: Optional[Callable] = None,
     ) -> List[DeviceInfo]:
-        """Execute scan using subprocess (fallback method)."""
+        """Execute scan using subprocess (fallback method) with real-time progress."""
         devices = []
         
         try:
             arguments = self.get_scan_arguments()
+            # Add --stats-every to get periodic progress updates from nmap
+            if "--stats-every" not in arguments:
+                arguments += " --stats-every 5s"
+            
             cmd = [self._nmap_path] + arguments.split() + ["-oX", "-", self._cidr]
             
             input_password = None
@@ -327,21 +385,93 @@ class NmapScanner(BaseScanner):
                 text=True,
             )
             
-            # If we have a password, we need to send it first
-            stdin_data = None
+            # Send sudo password if needed
             if input_password:
-                stdin_data = input_password
+                try:
+                    self._current_process.stdin.write(input_password)
+                    self._current_process.stdin.flush()
+                    self._current_process.stdin.close()
+                except:
+                    pass
             
-            # Read all output using communicate to avoid deadlocks
+            # Collect output using threads for real-time reading
+            stdout_lines = []
+            stderr_lines = []
+            hosts_found = 0
+            total_hosts = self.get_host_count()
+            
+            def read_stderr():
+                """Read stderr in background thread for progress updates."""
+                nonlocal hosts_found
+                try:
+                    for line in iter(self._current_process.stderr.readline, ''):
+                        if not line:
+                            break
+                        line = line.strip()
+                        stderr_lines.append(line)
+                        
+                        # Parse nmap progress from stderr (--stats-every output)
+                        # Format: "Stats: 0:00:30 elapsed; 128 hosts completed (1 up), 1 undergoing ..."
+                        # Or: "About 45.00% done; ETC: 12:30 (0:01:00 remaining)"
+                        if "% done" in line.lower():
+                            try:
+                                match = re.search(r'(\d+\.?\d*)%\s*done', line, re.IGNORECASE)
+                                if match:
+                                    pct = float(match.group(1))
+                                    # Map nmap's 0-100% to our 10-95% range
+                                    progress = 10 + (pct / 100) * 85
+                                    self._update_progress(progress, hosts_found)
+                            except:
+                                pass
+                        
+                        # Also check for hosts completed
+                        if "hosts completed" in line.lower():
+                            try:
+                                match = re.search(r'(\d+)\s*hosts completed', line, re.IGNORECASE)
+                                if match:
+                                    hosts_found = int(match.group(1))
+                            except:
+                                pass
+                        
+                        if log_callback:
+                            try:
+                                log_callback(f"[PROGRESS] {line}")
+                            except:
+                                pass
+                except Exception as e:
+                    logger.debug(f"Stderr reader error: {e}")
+            
+            def read_stdout():
+                """Read stdout (XML output) in background thread."""
+                nonlocal hosts_found
+                try:
+                    for line in iter(self._current_process.stdout.readline, ''):
+                        if not line:
+                            break
+                        stdout_lines.append(line)
+                        
+                        # Track progress by counting discovered hosts in XML
+                        if '<host ' in line:
+                            hosts_found += 1
+                            progress = 10 + (hosts_found / max(total_hosts, 1)) * 85
+                            progress = min(progress, 95)
+                            self._update_progress(progress, hosts_found)
+                except Exception as e:
+                    logger.debug(f"Stdout reader error: {e}")
+            
+            # Start reader threads
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+            stderr_thread.start()
+            stdout_thread.start()
+            
+            # Wait for process to complete with timeout
             try:
-                stdout, stderr = self._current_process.communicate(input=stdin_data, timeout=self._timeout)
+                self._current_process.wait(timeout=self._timeout)
             except subprocess.TimeoutExpired:
                 logger.warning("Nmap scan timed out, killing process")
                 self._current_process.kill()
-                try:
-                    stdout, stderr = self._current_process.communicate(timeout=5)
-                except:
-                    stdout, stderr = "", ""
+                self._current_process.wait(timeout=5)
                 
                 if log_callback:
                     try:
@@ -349,39 +479,16 @@ class NmapScanner(BaseScanner):
                     except:
                         pass
                 raise TimeoutError(f"Scan timed out after {self._timeout} seconds")
-            except Exception as e:
-                logger.error(f"Error during communicate: {e}")
-                raise
             
-            # Process stdout for progress and results
-            if stdout:
-                hosts_found = 0
-                total_hosts = self.get_host_count()
-                
-                for line in stdout.split('\n'):
-                    try:
-                        if line and log_callback:
-                            log_callback(line)
-                    except:
-                        pass
-                    
-                    # Track progress by counting discovered hosts
-                    if line and '<host ' in line:
-                        hosts_found += 1
-                        # Progress from 10% to 95% based on hosts scanned
-                        progress = 10 + (hosts_found / max(total_hosts, 1)) * 85
-                        progress = min(progress, 95)  # Cap at 95% until scan completes
-                        self._update_progress(progress, hosts_found)
+            # Wait for reader threads to finish
+            stderr_thread.join(timeout=5)
+            stdout_thread.join(timeout=5)
             
-            if stderr:
-                try:
-                    if log_callback:
-                        log_callback(f"[STDERR] {stderr[:500]}")  # Log first 500 chars only
-                except:
-                    pass
-                
-                if self._current_process.returncode != 0:
-                    logger.warning(f"Nmap returned non-zero: {stderr[:200]}")
+            stdout = ''.join(stdout_lines)
+            stderr = '\n'.join(stderr_lines)
+            
+            if stderr and self._current_process.returncode != 0:
+                logger.warning(f"Nmap returned non-zero: {stderr[:200]}")
             
             # Parse XML output
             devices = self._parse_xml_output(stdout) if stdout else []
